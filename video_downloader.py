@@ -51,7 +51,7 @@ class DownloaderApp(tk.Tk):
         self._paused = False
         self._thread = None
         self._urls = []          # list of (title, url)
-        self._url_groups = []    # list of (source_name, [(title, url), ...])
+        self._url_groups = []    # list of group dicts: source_name, output_name, rows
         self._output_dir = os.path.expanduser("~/Downloads/vkvideos")
         self._links_file = ""
         self._links_sources = []
@@ -321,6 +321,10 @@ class DownloaderApp(tk.Tk):
             "info",
         )
 
+    def _make_output_folder_name(self, source_name):
+        stem = Path(source_name).stem
+        return sanitize_filename(stem if stem else source_name)
+
     def _load_links_file(self):
         path = filedialog.askopenfilename(
             title="Select link file with video URLs",
@@ -334,7 +338,12 @@ class DownloaderApp(tk.Tk):
             duplicate_count = len(rows) - len(deduped_rows)
 
             self._urls = deduped_rows
-            self._url_groups = [(Path(path).name, deduped_rows)]
+            source_name = Path(path).name
+            self._url_groups = [{
+                "source_name": source_name,
+                "output_name": self._make_output_folder_name(source_name),
+                "rows": deduped_rows,
+            }]
             self._links_file = path
             self._links_sources = [path]
             self._refresh_loaded_summary(Path(path).name)
@@ -374,7 +383,12 @@ class DownloaderApp(tk.Tk):
                 duplicate_count += len(rows) - len(deduped_rows)
                 if not deduped_rows:
                     continue
-                groups.append((Path(source_file).name, deduped_rows))
+                source_name = Path(source_file).name
+                groups.append({
+                    "source_name": source_name,
+                    "output_name": self._make_output_folder_name(source_name),
+                    "rows": deduped_rows,
+                })
                 collected.extend(deduped_rows)
 
             if not groups:
@@ -423,11 +437,18 @@ class DownloaderApp(tk.Tk):
             messagebox.showwarning("Invalid Number", "Enter a value greater than 0.")
             return
 
-        groups = self._url_groups if self._url_groups else [("links", self._urls)]
+        groups = self._url_groups if self._url_groups else [{
+            "source_name": "links",
+            "output_name": "links",
+            "rows": self._urls,
+        }]
         active_urls = []
-        for source_name, rows in groups:
+        for group in groups:
+            source_name = group["source_name"]
+            rows = group["rows"]
             selected = rows if per_file_limit is None else rows[:per_file_limit]
-            active_urls.extend(selected)
+            for title, url in selected:
+                active_urls.append((group, title, url))
             self._log_write(
                 f"Selected {len(selected)} from {source_name}",
                 "muted",
@@ -451,8 +472,6 @@ class DownloaderApp(tk.Tk):
         self._downloaded = 0
         self._failed     = 0
         self._failed_urls = []
-        self._archive_file = os.path.join(self._output_dir, "download_archive.txt")
-        self._failed_urls_file = os.path.join(self._output_dir, "failed_urls.txt")
         self._start_time = time.time()
         self._stat_vars["done"].set("0")
         self._stat_vars["failed"].set("0")
@@ -510,19 +529,32 @@ class DownloaderApp(tk.Tk):
 
     # ─────────────── DOWNLOAD LOOP ───────────────
     def _download_all(self):
-        for i, (title, url) in enumerate(self._active_urls):
+        previous_output_name = None
+        for i, (group, title, url) in enumerate(self._active_urls):
             if self._stop_flag:
                 break
 
             while self._paused:
                 time.sleep(0.5)
 
+            output_name = group["output_name"]
+            source_name = group["source_name"]
+            file_output_dir = os.path.join(self._output_dir, output_name)
+            os.makedirs(file_output_dir, exist_ok=True)
+
+            archive_file = os.path.join(file_output_dir, "download_archive.txt")
+            failed_urls_file = os.path.join(file_output_dir, "failed_urls.txt")
+
+            if output_name != previous_output_name:
+                self._log_write(f"Output folder: {file_output_dir}", "info")
+                previous_output_name = output_name
+
             # Use %(title).150s to avoid incredibly long titles causing OS errors
             display_title = sanitize_filename(title) if title and title != "nan" else f"video_{i+1}"
-            out_tmpl   = os.path.join(self._output_dir, "%(title).150s.%(ext)s")
+            out_tmpl   = os.path.join(file_output_dir, "%(title).150s.%(ext)s")
 
-            self._cur_title.set(f"↓ Fetching ... {display_title[:60]}")
-            self._log_write(f"[{i+1}/{self._total}] Starting: {display_title}", "info")
+            self._cur_title.set(f"↓ [{source_name}] {display_title[:60]}")
+            self._log_write(f"[{i+1}/{self._total}] Starting: {display_title} ({source_name})", "info")
 
             def progress_hook(d):
                 if d["status"] == "downloading":
@@ -565,7 +597,7 @@ class DownloaderApp(tk.Tk):
                 "socket_timeout": 20,
                 "windowsfilenames": True,
                 "continuedl": True,
-                "download_archive": self._archive_file,
+                "download_archive": archive_file,
                 # Try cookies if available, uncomment and set browser to bypass age-restricted fully if needed
                 # "cookiesfrombrowser": ("chrome",), 
                 "postprocessors": [{
@@ -599,7 +631,7 @@ class DownloaderApp(tk.Tk):
                 self._log_write(f"✓ Done: {display_title}", "ok")
             else:
                 self._failed += 1
-                self._failed_urls.append(url)
+                self._failed_urls.append((failed_urls_file, url))
                 self._stat_vars["failed"].set(str(self._failed))
                 self._log_write(f"✗ Failed: {display_title} → {last_error}", "err")
 
@@ -609,13 +641,18 @@ class DownloaderApp(tk.Tk):
 
         if self._failed_urls:
             try:
-                with open(self._failed_urls_file, "w", encoding="utf-8") as handle:
-                    for failed_url in self._failed_urls:
-                        handle.write(f"{failed_url}\n")
-                self._log_write(
-                    f"Saved failed URLs to: {Path(self._failed_urls_file).name}",
-                    "warn",
-                )
+                grouped_failed = {}
+                for failed_file, failed_url in self._failed_urls:
+                    grouped_failed.setdefault(failed_file, []).append(failed_url)
+
+                for failed_file, failed_list in grouped_failed.items():
+                    with open(failed_file, "w", encoding="utf-8") as handle:
+                        for failed_url in failed_list:
+                            handle.write(f"{failed_url}\n")
+                    self._log_write(
+                        f"Saved failed URLs to: {failed_file}",
+                        "warn",
+                    )
             except Exception as e:
                 self._log_write(f"Could not save failed URLs file: {e}", "err")
         # ── Finished ──
