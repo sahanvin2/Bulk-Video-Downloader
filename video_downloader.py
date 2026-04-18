@@ -25,7 +25,7 @@ QUALITY_FORMAT = (
 )
 
 DEFAULT_DOWNLOAD_SELECTION = "200"
-MAX_DOWNLOADS_PER_FILE = 200
+SUPPORTED_LINK_EXTENSIONS = {".csv", ".txt", ".tsv", ".list"}
 NETWORK_RETRY_ATTEMPTS = 4
 NETWORK_RETRY_BASE_DELAY_SEC = 3
 INTER_ITEM_DELAY_SEC = 0
@@ -51,8 +51,10 @@ class DownloaderApp(tk.Tk):
         self._paused = False
         self._thread = None
         self._urls = []          # list of (title, url)
+        self._url_groups = []    # list of (source_name, [(title, url), ...])
         self._output_dir = os.path.expanduser("~/Downloads/vkvideos")
         self._links_file = ""
+        self._links_sources = []
         self._downloaded = 0
         self._failed = 0
         self._total = 0
@@ -128,7 +130,12 @@ class DownloaderApp(tk.Tk):
                                   command=self._load_links_file, **btn_style)
         self._btn_csv.pack(side="left", padx=(0, 6))
 
-        self._links_var = tk.StringVar(value="No file selected")
+        self._btn_folder = tk.Button(ctrl, text="LINK FOLDER",
+                         bg=ACCENT2, fg="white",
+                         command=self._load_links_folder, **btn_style)
+        self._btn_folder.pack(side="left", padx=(0, 6))
+
+        self._links_var = tk.StringVar(value="No source selected")
         tk.Label(ctrl, textvariable=self._links_var,
              font=("Courier New", 9), fg=MUTED, bg=BG,
              wraplength=200, anchor="w", width=24).pack(side="left", padx=(0, 10))
@@ -251,6 +258,69 @@ class DownloaderApp(tk.Tk):
             unique.append((title, url))
         return unique
 
+    def _load_urls_from_path(self, path):
+        rows = []
+        suffix = Path(path).suffix.lower()
+
+        if suffix in {".txt", ".list", ".tsv"}:
+            with open(path, "r", encoding="utf-8-sig", errors="ignore") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    url = self._extract_url(line)
+                    if url:
+                        rows.append(("", url))
+            return rows
+
+        with open(path, "r", encoding="utf-8-sig", errors="ignore", newline="") as handle:
+            reader = csv.DictReader(handle)
+            fieldnames = reader.fieldnames or []
+            url_col = next(
+                (c for c in fieldnames if "url" in c.lower() or "link" in c.lower()),
+                None,
+            )
+            title_col = next(
+                (c for c in fieldnames if "title" in c.lower() or "name" in c.lower()),
+                None,
+            )
+
+            if url_col:
+                for row in reader:
+                    url = self._extract_url(row.get(url_col, ""))
+                    if not url:
+                        continue
+                    title = str(row.get(title_col, "")).strip() if title_col else ""
+                    rows.append((title, url))
+                return rows
+
+            handle.seek(0)
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                url = self._extract_url(line)
+                if url:
+                    rows.append(("", url))
+
+        return rows
+
+    def _refresh_loaded_summary(self, source_name):
+        self._total = len(self._urls)
+        self._stat_vars["total"].set(str(self._total))
+        self._limit_var.set(DEFAULT_DOWNLOAD_SELECTION)
+        self._links_var.set(source_name)
+        if len(self._url_groups) > 1:
+            self._overall_label.set(
+                f"Loaded {self._total} videos from {len(self._url_groups)} files - limit is per file"
+            )
+        else:
+            self._overall_label.set(f"Loaded {self._total} videos - ready to download")
+        self._log_write(
+            f"Links loaded: {self._total} videos from {source_name}",
+            "info",
+        )
+
     def _load_links_file(self):
         path = filedialog.askopenfilename(
             title="Select link file with video URLs",
@@ -259,67 +329,71 @@ class DownloaderApp(tk.Tk):
         if not path:
             return
         try:
-            self._urls = []
-            suffix = Path(path).suffix.lower()
+            rows = self._load_urls_from_path(path)
+            deduped_rows = self._dedupe_urls(rows)
+            duplicate_count = len(rows) - len(deduped_rows)
 
-            if suffix in {".txt", ".list", ".tsv"}:
-                with open(path, "r", encoding="utf-8-sig", errors="ignore") as handle:
-                    for line in handle:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        url = self._extract_url(line)
-                        if url:
-                            self._urls.append(("", url))
-            else:
-                with open(path, "r", encoding="utf-8-sig", errors="ignore", newline="") as handle:
-                    reader = csv.DictReader(handle)
-                    fieldnames = reader.fieldnames or []
-                    url_col = next(
-                        (c for c in fieldnames if "url" in c.lower() or "link" in c.lower()),
-                        None,
-                    )
-                    title_col = next(
-                        (c for c in fieldnames if "title" in c.lower() or "name" in c.lower()),
-                        None,
-                    )
-
-                    if url_col:
-                        for row in reader:
-                            url = self._extract_url(row.get(url_col, ""))
-                            if not url:
-                                continue
-                            title = str(row.get(title_col, "")).strip() if title_col else ""
-                            self._urls.append((title, url))
-                    else:
-                        handle.seek(0)
-                        for line in handle:
-                            line = line.strip()
-                            if not line:
-                                continue
-                            url = self._extract_url(line)
-                            if url:
-                                self._urls.append(("", url))
-
-            original_count = len(self._urls)
-            self._urls = self._dedupe_urls(self._urls)
-            duplicate_count = original_count - len(self._urls)
-
-            self._total = len(self._urls)
-            self._stat_vars["total"].set(str(self._total))
-            self._limit_var.set(DEFAULT_DOWNLOAD_SELECTION)
+            self._urls = deduped_rows
+            self._url_groups = [(Path(path).name, deduped_rows)]
             self._links_file = path
-            self._links_var.set(Path(path).name)
-            preview_total = min(self._total, MAX_DOWNLOADS_PER_FILE)
-            self._overall_label.set(f"Loaded {self._total} videos — ready to download {preview_total}")
-            self._log_write(
-                f"Links loaded: {self._total} videos from {Path(path).name} (will download up to {MAX_DOWNLOADS_PER_FILE})",
-                "info",
-            )
+            self._links_sources = [path]
+            self._refresh_loaded_summary(Path(path).name)
             if duplicate_count:
                 self._log_write(f"Removed {duplicate_count} duplicate URLs.", "warn")
         except Exception as e:
             messagebox.showerror("Link File Error", str(e))
+
+    def _load_links_folder(self):
+        folder = filedialog.askdirectory(title="Select folder containing links files")
+        if not folder:
+            return
+
+        try:
+            source_files = []
+            for name in os.listdir(folder):
+                full_path = os.path.join(folder, name)
+                if not os.path.isfile(full_path):
+                    continue
+                if Path(full_path).suffix.lower() in SUPPORTED_LINK_EXTENSIONS:
+                    source_files.append(full_path)
+
+            if not source_files:
+                messagebox.showwarning(
+                    "No Link Files",
+                    "No supported links files found (.csv, .txt, .tsv, .list).",
+                )
+                return
+
+            source_files.sort()
+            collected = []
+            groups = []
+            duplicate_count = 0
+            for source_file in source_files:
+                rows = self._load_urls_from_path(source_file)
+                deduped_rows = self._dedupe_urls(rows)
+                duplicate_count += len(rows) - len(deduped_rows)
+                if not deduped_rows:
+                    continue
+                groups.append((Path(source_file).name, deduped_rows))
+                collected.extend(deduped_rows)
+
+            if not groups:
+                messagebox.showwarning(
+                    "No URLs",
+                    "Supported files were found, but no valid links were detected.",
+                )
+                return
+
+            self._urls = collected
+            self._url_groups = groups
+            self._links_sources = source_files
+            self._links_file = folder
+            self._refresh_loaded_summary(f"{Path(folder).name} ({len(groups)} files)")
+            self._log_write(f"Scanned folder: {folder}", "info")
+            if duplicate_count:
+                self._log_write(f"Removed {duplicate_count} duplicate URLs (within files).", "warn")
+        except Exception as e:
+            messagebox.showerror("Folder Load Error", str(e))
 
     def _choose_dir(self):
         d = filedialog.askdirectory(title="Choose output folder")
@@ -329,7 +403,7 @@ class DownloaderApp(tk.Tk):
 
     def _start(self):
         if not self._urls:
-            messagebox.showwarning("No URLs", "Please load a link file first.")
+            messagebox.showwarning("No URLs", "Please load a link source first.")
             return
         os.makedirs(self._output_dir, exist_ok=True)
         self._stop_flag = False
@@ -338,23 +412,41 @@ class DownloaderApp(tk.Tk):
         try:
             limit_val = self._limit_var.get().strip().lower()
             if not limit_val or limit_val == "all":
-                limit = MAX_DOWNLOADS_PER_FILE
+                per_file_limit = None
             else:
-                limit = int(limit_val)
+                per_file_limit = int(limit_val)
         except ValueError:
             messagebox.showwarning("Invalid Number", "Enter a positive number or 'all'.")
             return
 
-        if limit <= 0:
+        if per_file_limit is not None and per_file_limit <= 0:
             messagebox.showwarning("Invalid Number", "Enter a value greater than 0.")
             return
 
-        limit = min(limit, len(self._urls), MAX_DOWNLOADS_PER_FILE)
+        groups = self._url_groups if self._url_groups else [("links", self._urls)]
+        active_urls = []
+        for source_name, rows in groups:
+            selected = rows if per_file_limit is None else rows[:per_file_limit]
+            active_urls.extend(selected)
+            self._log_write(
+                f"Selected {len(selected)} from {source_name}",
+                "muted",
+            )
 
-        self._active_urls = self._urls[:limit]
+        if not active_urls:
+            messagebox.showwarning("No URLs", "No URLs matched the selected limit.")
+            return
+
+        self._active_urls = active_urls
         self._total = len(self._active_urls)
         self._stat_vars["total"].set(str(self._total))
-        self._overall_label.set(f"Starting download of {self._total} videos")
+        if len(groups) > 1:
+            limit_text = "all" if per_file_limit is None else str(per_file_limit)
+            self._overall_label.set(
+                f"Starting download of {self._total} videos ({limit_text} per file across {len(groups)} files)"
+            )
+        else:
+            self._overall_label.set(f"Starting download of {self._total} videos")
         
         self._downloaded = 0
         self._failed     = 0
